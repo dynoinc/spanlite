@@ -1,0 +1,44 @@
+name: Check
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install Protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        version: "33.x"
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Setup Rust Cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Setup Just
+      uses: extractions/setup-just@v2
+
+    - name: Run just check
+      run: just check
+
+    - name: Verify no unwanted changes
+      run: |
+        if [[ -n $(git status --porcelain) ]]; then
+          echo "Error: Unwanted changes detected after running 'just check'"
+          git status
+          git diff
+          exit 1
+        fi
