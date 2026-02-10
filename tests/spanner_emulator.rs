@@ -236,7 +236,9 @@ async fn one_shot_query_against_emulator() -> TestResult<()> {
         "projects/{}/instances/{}/databases/{}",
         db.project, db.instance, db.database
     );
-    let config = ClientConfig::new(db_path, StaticTokenSource).with_endpoint(grpc_endpoint);
+    let config = ClientConfig::new(db_path, StaticTokenSource)
+        .with_endpoint(grpc_endpoint)
+        .with_session_pool_size(4);
     let client = Client::new(config).await?;
 
     // Strong read

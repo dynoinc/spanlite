@@ -159,6 +159,7 @@ pub struct ClientConfig<T: TokenSource> {
     database: String,
     token_source: T,
     endpoint: String,
+    session_pool_size: usize,
 }
 
 impl<T: TokenSource> ClientConfig<T> {
@@ -168,6 +169,7 @@ impl<T: TokenSource> ClientConfig<T> {
             database: database.into(),
             token_source,
             endpoint: DEFAULT_ENDPOINT.to_string(),
+            session_pool_size: 1,
         }
     }
 
@@ -178,11 +180,19 @@ impl<T: TokenSource> ClientConfig<T> {
         self.endpoint = endpoint.into();
         self
     }
+
+    /// Configure how many multiplexed sessions to keep in the client pool.
+    ///
+    /// Requests are distributed randomly across pooled sessions.
+    pub fn with_session_pool_size(mut self, session_pool_size: usize) -> Self {
+        self.session_pool_size = session_pool_size;
+        self
+    }
 }
 
 /// A Cloud Spanner client for high-throughput one-shot reads.
 ///
-/// Uses a single multiplexed session (auto-rotated before expiry).
+/// Uses a pool of multiplexed sessions (auto-rotated before expiry).
 /// All queries use single-use read-only transactions (one RPC per query).
 #[derive(Clone)]
 pub struct Client {
@@ -191,13 +201,19 @@ pub struct Client {
 }
 
 impl Client {
-    /// Connect to Spanner and create a multiplexed session.
+    /// Connect to Spanner and create pooled multiplexed sessions.
     pub async fn new<T: TokenSource>(config: ClientConfig<T>) -> Result<Self> {
         let ClientConfig {
             database,
             token_source,
             endpoint,
+            session_pool_size,
         } = config;
+        if session_pool_size == 0 {
+            return Err(Error::Auth(
+                "session_pool_size must be greater than 0".to_string(),
+            ));
+        }
 
         let use_tls = endpoint_uses_tls(&endpoint)?;
         let endpoint = tonic::transport::Endpoint::from_shared(endpoint)
@@ -213,7 +229,7 @@ impl Client {
 
         let auth_channel = AuthService::new(channel, token_source);
         let mut grpc_client = pb::spanner_client::SpannerClient::new(auth_channel);
-        let session = SessionManager::new(&mut grpc_client, &database).await?;
+        let session = SessionManager::new(&mut grpc_client, &database, session_pool_size).await?;
 
         Ok(Self {
             client: grpc_client,
@@ -497,6 +513,46 @@ impl<'a> ReadWriteBuilder<'a, Instant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone, Copy)]
+    struct StaticTokenSource;
+
+    impl TokenSource for StaticTokenSource {
+        fn token(
+            &self,
+        ) -> impl std::future::Future<
+            Output = std::result::Result<String, Box<dyn std::error::Error + Send + Sync>>,
+        > + Send {
+            std::future::ready(Ok("test-token".to_string()))
+        }
+    }
+
+    #[test]
+    fn client_config_defaults_to_single_session_pool() {
+        let config = ClientConfig::new("projects/p/instances/i/databases/d", StaticTokenSource);
+        assert_eq!(config.session_pool_size, 1);
+    }
+
+    #[test]
+    fn client_config_allows_custom_session_pool_size() {
+        let config = ClientConfig::new("projects/p/instances/i/databases/d", StaticTokenSource)
+            .with_session_pool_size(16);
+        assert_eq!(config.session_pool_size, 16);
+    }
+
+    #[tokio::test]
+    async fn client_new_rejects_zero_session_pool_size() {
+        let config = ClientConfig::new("projects/p/instances/i/databases/d", StaticTokenSource)
+            .with_session_pool_size(0);
+        let err = match Client::new(config).await {
+            Ok(_) => panic!("pool size 0 should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            matches!(err, Error::Auth(ref msg) if msg.contains("session_pool_size")),
+            "expected session pool size validation error, got {err:?}"
+        );
+    }
 
     #[test]
     fn read_only_options_is_strong() {
