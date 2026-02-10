@@ -9,7 +9,8 @@ mod session;
 
 pub use auth::TokenSource;
 pub use client::{
-    Client, ClientConfig, ReadOnlyBuilder, ReadOnlyQueryBuilder, RequestPriority, TimestampBound,
+    Client, ClientConfig, ReadOnlyBuilder, ReadOnlyQueryBuilder, ReadWriteBuilder, ReadWriteResult,
+    RequestPriority, TimestampBound,
 };
 pub use error::{Error, Result};
 pub use params::ToSpanner;

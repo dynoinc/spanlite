@@ -73,6 +73,15 @@ fn read_only_options(bound: TimestampBound) -> pb::TransactionOptions {
     }
 }
 
+fn read_write_options() -> pb::TransactionOptions {
+    pb::TransactionOptions {
+        mode: Some(pb::transaction_options::Mode::ReadWrite(
+            pb::transaction_options::ReadWrite::default(),
+        )),
+        ..Default::default()
+    }
+}
+
 fn make_request_options(
     request_tag: Option<&str>,
     priority: Option<RequestPriority>,
@@ -89,6 +98,7 @@ fn make_request_options(
 
 const DEFAULT_ENDPOINT: &str = "https://spanner.googleapis.com";
 const READ_ONLY_DEADLINE_EXCEEDED_MSG: &str = "read-only query deadline exceeded";
+const READ_WRITE_DEADLINE_EXCEEDED_MSG: &str = "read-write query deadline exceeded";
 
 fn endpoint_uses_tls(endpoint: &str) -> Result<bool> {
     let uri: http::Uri = endpoint
@@ -107,15 +117,41 @@ fn endpoint_uses_tls(endpoint: &str) -> Result<bool> {
     }
 }
 
-fn remaining_timeout(deadline: Instant) -> std::result::Result<Duration, tonic::Status> {
+fn remaining_timeout(
+    deadline: Instant,
+    exceeded_msg: &'static str,
+) -> std::result::Result<Duration, tonic::Status> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
-        Err(tonic::Status::deadline_exceeded(
-            READ_ONLY_DEADLINE_EXCEEDED_MSG,
-        ))
+        Err(tonic::Status::deadline_exceeded(exceeded_msg))
     } else {
         Ok(remaining)
     }
+}
+
+fn choose_precommit_token(
+    left: Option<pb::MultiplexedSessionPrecommitToken>,
+    right: Option<pb::MultiplexedSessionPrecommitToken>,
+) -> Option<pb::MultiplexedSessionPrecommitToken> {
+    match (left, right) {
+        (Some(a), Some(b)) => {
+            if a.seq_num >= b.seq_num {
+                Some(a)
+            } else {
+                Some(b)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Result for a one-shot read-write DML statement.
+#[derive(Debug, Clone)]
+pub struct ReadWriteResult {
+    pub affected_rows: i64,
+    pub commit_timestamp: prost_types::Timestamp,
 }
 
 /// Configuration for creating a [`Client`].
@@ -196,6 +232,15 @@ impl Client {
         }
     }
 
+    /// Start building a one-shot read-write DML statement.
+    pub fn read_write(&self) -> ReadWriteBuilder<'_> {
+        ReadWriteBuilder {
+            client: self,
+            priority: None,
+            deadline: (),
+        }
+    }
+
     fn execute_query<T: DeserializeOwned + 'static>(
         &self,
         sql: String,
@@ -227,7 +272,9 @@ impl Client {
             };
 
             let mut request = tonic::Request::new(req);
-            request.set_timeout(remaining_timeout(deadline).map_err(Error::Status)?);
+            request.set_timeout(
+                remaining_timeout(deadline, READ_ONLY_DEADLINE_EXCEEDED_MSG).map_err(Error::Status)?,
+            );
             let response = client.execute_streaming_sql(request).await.map_err(Error::Status)?;
             let mut stream = response.into_inner();
             let mut assembler = StreamingAssembler::new();
@@ -237,6 +284,96 @@ impl Client {
                     yield row.deserialize()?;
                 }
             }
+        })
+    }
+
+    async fn execute_dml(
+        &self,
+        sql: String,
+        param_struct: prost_types::Struct,
+        param_types: std::collections::HashMap<String, pb::Type>,
+        priority: Option<RequestPriority>,
+        deadline: Instant,
+    ) -> Result<ReadWriteResult> {
+        let mut client = self.client.clone();
+        let session_lease = self.session.lease().await;
+        let session_name = session_lease.name().to_string();
+        let _session_lease = session_lease;
+        let request_options = make_request_options(None, priority);
+
+        let mut execute_request = tonic::Request::new(pb::ExecuteSqlRequest {
+            session: session_name.clone(),
+            transaction: Some(pb::TransactionSelector {
+                selector: Some(pb::transaction_selector::Selector::Begin(
+                    read_write_options(),
+                )),
+            }),
+            sql,
+            params: Some(param_struct),
+            param_types,
+            seqno: 1,
+            request_options: request_options.clone(),
+            ..Default::default()
+        });
+        execute_request.set_timeout(
+            remaining_timeout(deadline, READ_WRITE_DEADLINE_EXCEEDED_MSG).map_err(Error::Status)?,
+        );
+        let execute_result = client
+            .execute_sql(execute_request)
+            .await
+            .map_err(Error::Status)?
+            .into_inner();
+
+        let tx = execute_result
+            .metadata
+            .and_then(|meta| meta.transaction)
+            .ok_or_else(|| {
+                Error::Status(tonic::Status::internal(
+                    "missing transaction metadata in DML ExecuteSql response",
+                ))
+            })?;
+        if tx.id.is_empty() {
+            return Err(Error::Status(tonic::Status::internal(
+                "missing transaction id in DML ExecuteSql response",
+            )));
+        }
+
+        let affected_rows = match execute_result.stats.and_then(|stats| stats.row_count) {
+            Some(pb::result_set_stats::RowCount::RowCountExact(rows)) => rows,
+            Some(pb::result_set_stats::RowCount::RowCountLowerBound(rows)) => rows,
+            None => {
+                return Err(Error::Status(tonic::Status::internal(
+                    "missing row count in DML ExecuteSql response",
+                )));
+            }
+        };
+
+        let commit_precommit_token =
+            choose_precommit_token(execute_result.precommit_token, tx.precommit_token);
+        let mut commit_request = tonic::Request::new(pb::CommitRequest {
+            session: session_name,
+            request_options,
+            precommit_token: commit_precommit_token,
+            transaction: Some(pb::commit_request::Transaction::TransactionId(tx.id)),
+            ..Default::default()
+        });
+        commit_request.set_timeout(
+            remaining_timeout(deadline, READ_WRITE_DEADLINE_EXCEEDED_MSG).map_err(Error::Status)?,
+        );
+        let commit_response = client
+            .commit(commit_request)
+            .await
+            .map_err(Error::Status)?
+            .into_inner();
+        let commit_timestamp = commit_response.commit_timestamp.ok_or_else(|| {
+            Error::Status(tonic::Status::internal(
+                "missing commit timestamp in Commit response",
+            ))
+        })?;
+
+        Ok(ReadWriteResult {
+            affected_rows,
+            commit_timestamp,
         })
     }
 }
@@ -308,6 +445,55 @@ impl<'a> ReadOnlyQueryBuilder<'a, Instant> {
     }
 }
 
+/// Builder for one-shot read-write DML statements.
+pub struct ReadWriteBuilder<'a, D = ()> {
+    client: &'a Client,
+    priority: Option<RequestPriority>,
+    deadline: D,
+}
+
+impl<'a, D> ReadWriteBuilder<'a, D> {
+    pub fn with_priority(mut self, p: RequestPriority) -> Self {
+        self.priority = Some(p);
+        self
+    }
+
+    pub fn with_timeout(self, timeout: Duration) -> ReadWriteBuilder<'a, Instant> {
+        let Self {
+            client, priority, ..
+        } = self;
+        ReadWriteBuilder {
+            client,
+            priority,
+            deadline: Instant::now() + timeout,
+        }
+    }
+}
+
+impl<'a> ReadWriteBuilder<'a, Instant> {
+    /// Execute a one-shot SQL DML statement inside a read-write transaction.
+    ///
+    /// This uses two RPCs:
+    /// - `ExecuteSql` with transaction selector `Begin(read_write)`
+    /// - `Commit` with the returned transaction id
+    pub async fn run(
+        self,
+        sql: &str,
+        params: &[(&str, &dyn ToSpanner)],
+    ) -> Result<ReadWriteResult> {
+        let (param_struct, param_types) = params_to_proto(params);
+        self.client
+            .execute_dml(
+                sql.to_string(),
+                param_struct,
+                param_types,
+                self.priority,
+                self.deadline,
+            )
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,6 +558,15 @@ mod tests {
     }
 
     #[test]
+    fn read_write_options_is_read_write() {
+        let options = read_write_options();
+        let mode = options.mode.expect("read-write mode should exist");
+        let pb::transaction_options::Mode::ReadWrite(_) = mode else {
+            panic!("expected read-write mode");
+        };
+    }
+
+    #[test]
     fn endpoint_scheme_tls_enabled_for_https() {
         assert!(
             endpoint_uses_tls("https://spanner.googleapis.com").expect("endpoint should parse")
@@ -395,7 +590,7 @@ mod tests {
 
     #[test]
     fn remaining_timeout_deadline_already_exceeded() {
-        let err = remaining_timeout(Instant::now())
+        let err = remaining_timeout(Instant::now(), READ_ONLY_DEADLINE_EXCEEDED_MSG)
             .expect_err("expired deadline should return deadline-exceeded status");
         assert_eq!(err.code(), tonic::Code::DeadlineExceeded);
     }

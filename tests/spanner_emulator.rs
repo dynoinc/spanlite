@@ -4,7 +4,7 @@ use futures_util::{TryStreamExt, pin_mut};
 use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::json;
-use spanlite::{Client, ClientConfig, TimestampBound, TokenSource};
+use spanlite::{Client, ClientConfig, RequestPriority, TimestampBound, TokenSource};
 use testcontainers::{
     GenericImage,
     core::{IntoContainerPort, WaitFor},
@@ -34,6 +34,12 @@ impl TokenSource for StaticTokenSource {
 #[derive(Debug, Deserialize)]
 struct IntRow {
     n: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemRow {
+    id: i64,
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,7 +189,10 @@ async fn bootstrap_database(rest_base: &str, db: DatabaseRef<'_>) -> TestResult<
         db.project, db.instance
     );
     let create_database_payload = json!({
-        "createStatement": format!("CREATE DATABASE `{}`", db.database)
+        "createStatement": format!("CREATE DATABASE `{}`", db.database),
+        "extraStatements": [
+            "CREATE TABLE items (id INT64 NOT NULL, value STRING(MAX)) PRIMARY KEY (id)"
+        ]
     });
     let op =
         post_operation_with_retry(&http, &create_database_url, create_database_payload).await?;
@@ -249,6 +258,35 @@ async fn one_shot_query_against_emulator() -> TestResult<()> {
     pin_mut!(stream);
     let row = stream.try_next().await?.expect("expected one row");
     assert_eq!(row.n, 2);
+
+    // Read-write DML (two RPC flow under the hood)
+    let id = 7i64;
+    let value = "hello".to_string();
+    let write_result = client
+        .read_write()
+        .with_priority(RequestPriority::Medium)
+        .with_timeout(Duration::from_secs(10))
+        .run(
+            "INSERT INTO items (id, value) VALUES (@id, @value)",
+            &[("id", &id), ("value", &value)],
+        )
+        .await?;
+    assert_eq!(write_result.affected_rows, 1);
+    assert!(
+        write_result.commit_timestamp.seconds > 0 || write_result.commit_timestamp.nanos > 0,
+        "commit timestamp should be set"
+    );
+
+    let lookup_params = [("id", &id as &dyn spanlite::ToSpanner)];
+    let stream = client
+        .read_only()
+        .with_timeout(Duration::from_secs(10))
+        .run::<ItemRow>("SELECT id, value FROM items WHERE id = @id", &lookup_params)?;
+    pin_mut!(stream);
+    let row = stream.try_next().await?.expect("expected inserted row");
+    assert_eq!(row.id, id);
+    assert_eq!(row.value, value);
+    assert!(stream.try_next().await?.is_none());
 
     Ok(())
 }

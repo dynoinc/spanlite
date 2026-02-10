@@ -5,7 +5,7 @@ Minimal async Rust client for Google Cloud Spanner, optimized for high-throughpu
 ## What it provides
 
 - One-shot read-only queries via `execute_streaming_sql` with single-use transactions
-  - Queries require an explicit client-side timeout via `.with_timeout(...)`
+- One-shot read-write DML via a 2-RPC flow (`ExecuteSql` begin + `Commit`)
 - Streaming row decoding into Rust structs via `serde`
 - Multiplexed sessions (auto-rotated before expiry)
 - Pluggable auth via a user-provided `TokenSource`
@@ -93,6 +93,30 @@ let rows = client
     .with_timestamp_bound(TimestampBound::ExactStaleness(Duration::from_secs(15)))
     .with_timeout(Duration::from_secs(10))
     .run::<Row>("SELECT 1 AS n", &[])?;
+```
+
+## One-shot DML
+
+```rust
+use spanlite::RequestPriority;
+
+let id = 7i64;
+let value = "hello".to_string();
+let write = client
+    .read_write()
+    .with_priority(RequestPriority::Medium)
+    .with_timeout(std::time::Duration::from_secs(10))
+    .run(
+        "INSERT INTO items (id, value) VALUES (@id, @value)",
+        &[("id", &id), ("value", &value)],
+    )
+    .await?;
+
+assert_eq!(write.affected_rows, 1);
+println!(
+    "committed at {}.{}",
+    write.commit_timestamp.seconds, write.commit_timestamp.nanos
+);
 ```
 
 ## Development
