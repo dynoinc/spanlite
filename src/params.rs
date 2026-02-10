@@ -13,7 +13,7 @@ fn scalar_type(code: pb::TypeCode) -> pb::Type {
 ///
 /// Implementations produce a `(Value, Type)` pair that correctly encodes
 /// the value according to Spanner's wire format (e.g. INT64 as a string).
-pub trait ToSpanner {
+pub trait ToSpanner: Sync {
     fn to_spanner(&self) -> (prost_types::Value, pb::Type);
 
     fn spanner_type() -> pb::Type

@@ -431,7 +431,7 @@ impl<'a> ReadOnlyQueryBuilder<'a, Instant> {
         self,
         sql: &str,
         params: &[(&str, &dyn ToSpanner)],
-    ) -> Result<impl Stream<Item = Result<T>>> {
+    ) -> Result<impl Stream<Item = Result<T>> + use<'a, T>> {
         let (param_struct, param_types) = params_to_proto(params);
         let request_options = make_request_options(self.request_tag.as_deref(), self.priority);
         self.client.execute_query(
