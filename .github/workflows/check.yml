@@ -37,7 +37,7 @@ jobs:
     - name: Verify no unwanted changes
       run: |
         if [[ -n $(git status --porcelain) ]]; then
-          echo "Error: Unwanted changes detected after running 'just check'"
+          echo "Error: Generated files or formatting are out of sync after running 'just check'"
           git status
           git diff
           exit 1

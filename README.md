@@ -1,4 +1,5 @@
 # spanlite
+[![Check](https://github.com/dynoinc/spanlite/actions/workflows/check.yml/badge.svg)](https://github.com/dynoinc/spanlite/actions/workflows/check.yml)
 
 Minimal async Rust client for Google Cloud Spanner, optimized for high-throughput one-shot reads.
 
@@ -13,7 +14,6 @@ Minimal async Rust client for Google Cloud Spanner, optimized for high-throughpu
 ## Requirements
 
 - Rust toolchain `1.88+`
-- `protoc` for build-time protobuf generation
 - Docker only for emulator integration tests
 
 ## Install
@@ -126,3 +126,5 @@ Run the full local check pipeline:
 ```bash
 just check
 ```
+
+`just check` requires `protoc`, regenerates `proto/spanlite_descriptor_set.bin`, and CI fails if generated files are out of sync.
