@@ -4,12 +4,12 @@ use std::time::{Duration, Instant};
 use futures_core::Stream;
 use serde::de::DeserializeOwned;
 
-use crate::auth::{AuthService, TokenSource};
+use crate::auth::{AuthLayer, TokenSource};
 use crate::error::{Error, Result};
 use crate::params::{ToSpanner, params_to_proto};
 use crate::proto::google::spanner::v1 as pb;
 use crate::result::StreamingAssembler;
-use crate::session::SessionManager;
+use crate::session::{GrpcClient, SessionManager};
 
 /// Timestamp bound for read-only operations.
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +117,24 @@ fn endpoint_uses_tls(endpoint: &str) -> Result<bool> {
     }
 }
 
+async fn connect_client_pool<T: TokenSource>(
+    endpoint: tonic::transport::Endpoint,
+    token_source: T,
+    pool_size: usize,
+) -> Result<Vec<GrpcClient>> {
+    debug_assert!(pool_size > 0, "pool_size must be non-zero");
+    let auth_layer = AuthLayer::new(token_source);
+
+    let mut clients = Vec::with_capacity(pool_size);
+    for _ in 0..pool_size {
+        let channel = endpoint.clone().connect().await.map_err(Error::Transport)?;
+        let auth_channel = auth_layer.wrap(channel);
+        clients.push(pb::spanner_client::SpannerClient::new(auth_channel));
+    }
+
+    Ok(clients)
+}
+
 fn remaining_timeout(
     deadline: Instant,
     exceeded_msg: &'static str,
@@ -159,7 +177,7 @@ pub struct ClientConfig<T: TokenSource> {
     database: String,
     token_source: T,
     endpoint: String,
-    session_pool_size: usize,
+    pool_size: usize,
 }
 
 impl<T: TokenSource> ClientConfig<T> {
@@ -169,7 +187,7 @@ impl<T: TokenSource> ClientConfig<T> {
             database: database.into(),
             token_source,
             endpoint: DEFAULT_ENDPOINT.to_string(),
-            session_pool_size: 1,
+            pool_size: 1,
         }
     }
 
@@ -181,11 +199,11 @@ impl<T: TokenSource> ClientConfig<T> {
         self
     }
 
-    /// Configure how many multiplexed sessions to keep in the client pool.
+    /// Configure how many session+transport slots to keep in the client pool.
     ///
-    /// Requests are distributed randomly across pooled sessions.
-    pub fn with_session_pool_size(mut self, session_pool_size: usize) -> Self {
-        self.session_pool_size = session_pool_size;
+    /// Each slot has its own multiplexed session and dedicated gRPC connection.
+    pub fn with_pool_size(mut self, pool_size: usize) -> Self {
+        self.pool_size = pool_size;
         self
     }
 }
@@ -196,7 +214,6 @@ impl<T: TokenSource> ClientConfig<T> {
 /// All queries use single-use read-only transactions (one RPC per query).
 #[derive(Clone)]
 pub struct Client {
-    client: pb::spanner_client::SpannerClient<AuthService<tonic::transport::Channel>>,
     session: Arc<SessionManager>,
 }
 
@@ -207,12 +224,11 @@ impl Client {
             database,
             token_source,
             endpoint,
-            session_pool_size,
+            pool_size,
         } = config;
-        if session_pool_size == 0 {
-            return Err(Error::Auth(
-                "session_pool_size must be greater than 0".to_string(),
-            ));
+
+        if pool_size == 0 {
+            return Err(Error::Auth("pool_size must be greater than 0".to_string()));
         }
 
         let use_tls = endpoint_uses_tls(&endpoint)?;
@@ -225,14 +241,10 @@ impl Client {
         } else {
             endpoint
         };
-        let channel = endpoint.connect().await.map_err(Error::Transport)?;
 
-        let auth_channel = AuthService::new(channel, token_source);
-        let mut grpc_client = pb::spanner_client::SpannerClient::new(auth_channel);
-        let session = SessionManager::new(&mut grpc_client, &database, session_pool_size).await?;
-
+        let clients = connect_client_pool(endpoint, token_source, pool_size).await?;
+        let session = SessionManager::new(clients, &database).await?;
         Ok(Self {
-            client: grpc_client,
             session: Arc::new(session),
         })
     }
@@ -267,11 +279,10 @@ impl Client {
         deadline: Instant,
     ) -> Result<impl Stream<Item = Result<T>>> {
         let session_manager = self.session.clone();
-        let mut client = self.client.clone();
         let options = read_only_options(bound);
 
         Ok(async_stream::try_stream! {
-            let session_lease = session_manager.lease().await;
+            let (session_lease, mut client) = session_manager.lease().await;
             let session_name = session_lease.name().to_string();
             let _session_lease = session_lease;
 
@@ -311,8 +322,7 @@ impl Client {
         priority: Option<RequestPriority>,
         deadline: Instant,
     ) -> Result<ReadWriteResult> {
-        let mut client = self.client.clone();
-        let session_lease = self.session.lease().await;
+        let (session_lease, mut client) = self.session.lease().await;
         let session_name = session_lease.name().to_string();
         let _session_lease = session_lease;
         let request_options = make_request_options(None, priority);
@@ -530,27 +540,27 @@ mod tests {
     #[test]
     fn client_config_defaults_to_single_session_pool() {
         let config = ClientConfig::new("projects/p/instances/i/databases/d", StaticTokenSource);
-        assert_eq!(config.session_pool_size, 1);
+        assert_eq!(config.pool_size, 1);
     }
 
     #[test]
-    fn client_config_allows_custom_session_pool_size() {
+    fn client_config_allows_custom_pool_size() {
         let config = ClientConfig::new("projects/p/instances/i/databases/d", StaticTokenSource)
-            .with_session_pool_size(16);
-        assert_eq!(config.session_pool_size, 16);
+            .with_pool_size(16);
+        assert_eq!(config.pool_size, 16);
     }
 
     #[tokio::test]
-    async fn client_new_rejects_zero_session_pool_size() {
+    async fn client_new_rejects_zero_pool_size() {
         let config = ClientConfig::new("projects/p/instances/i/databases/d", StaticTokenSource)
-            .with_session_pool_size(0);
+            .with_pool_size(0);
         let err = match Client::new(config).await {
             Ok(_) => panic!("pool size 0 should fail"),
             Err(err) => err,
         };
         assert!(
-            matches!(err, Error::Auth(ref msg) if msg.contains("session_pool_size")),
-            "expected session pool size validation error, got {err:?}"
+            matches!(err, Error::Auth(ref msg) if msg.contains("pool_size")),
+            "expected pool size validation error, got {err:?}"
         );
     }
 

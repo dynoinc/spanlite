@@ -238,7 +238,7 @@ async fn one_shot_query_against_emulator() -> TestResult<()> {
     );
     let config = ClientConfig::new(db_path, StaticTokenSource)
         .with_endpoint(grpc_endpoint)
-        .with_session_pool_size(4);
+        .with_pool_size(4);
     let client = Client::new(config).await?;
 
     // Strong read

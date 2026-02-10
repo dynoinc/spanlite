@@ -18,6 +18,12 @@ pub trait TokenSource: Send + Sync + 'static {
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
+/// Shared auth context used to build per-channel auth services.
+#[derive(Clone)]
+pub(crate) struct AuthLayer {
+    token_source: Arc<dyn TokenSourceDyn>,
+}
+
 /// Tower service layer that injects `Authorization: Bearer <token>` into requests.
 #[derive(Clone)]
 pub(crate) struct AuthService<S> {
@@ -36,11 +42,17 @@ impl<T: TokenSource> TokenSourceDyn for T {
     }
 }
 
-impl<S> AuthService<S> {
-    pub(crate) fn new<T: TokenSource>(inner: S, token_source: T) -> Self {
+impl AuthLayer {
+    pub(crate) fn new<T: TokenSource>(token_source: T) -> Self {
         Self {
-            inner,
             token_source: Arc::new(token_source),
+        }
+    }
+
+    pub(crate) fn wrap<S>(&self, inner: S) -> AuthService<S> {
+        AuthService {
+            inner,
+            token_source: self.token_source.clone(),
         }
     }
 }

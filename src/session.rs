@@ -49,10 +49,10 @@ impl SessionPool {
         Self { slots }
     }
 
-    fn lease_random(&self) -> SessionLease {
+    fn lease_random(&self) -> (usize, SessionLease) {
         debug_assert!(!self.slots.is_empty(), "session pool must be non-empty");
         let idx = fastrand::usize(..self.slots.len());
-        self.slots[idx].acquire()
+        (idx, self.slots[idx].acquire())
     }
 }
 
@@ -106,29 +106,24 @@ async fn wait_for_pool_drain(pool: &Arc<SessionPool>) {
 /// server expiry), then drains and deletes the previous pool.
 pub(crate) struct SessionManager {
     current: Arc<RwLock<Arc<SessionPool>>>,
+    clients: Arc<Vec<GrpcClient>>,
     rotation_handle: tokio::task::JoinHandle<()>,
 }
 
 impl SessionManager {
     /// Create pooled multiplexed sessions and start background rotation.
-    pub(crate) async fn new(
-        client: &mut GrpcClient,
-        database: &str,
-        pool_size: usize,
-    ) -> Result<Self> {
-        if pool_size == 0 {
-            return Err(Error::Auth(
-                "session_pool_size must be greater than 0".to_string(),
-            ));
+    pub(crate) async fn new(clients: Vec<GrpcClient>, database: &str) -> Result<Self> {
+        if clients.is_empty() {
+            return Err(Error::Auth("pool_size must be greater than 0".to_string()));
         }
 
-        let initial_pool = Arc::new(Self::create_pool(client, database, pool_size).await?);
+        let clients = Arc::new(clients);
+        let initial_pool = Arc::new(Self::create_pool(clients.as_ref(), database).await?);
         let current = Arc::new(RwLock::new(initial_pool));
 
         let rotation_current = current.clone();
-        let mut rotation_client = client.clone();
+        let rotation_clients = clients.clone();
         let rotation_db = database.to_string();
-        let rotation_pool_size = pool_size;
 
         let handle = tokio::spawn(async move {
             // Rotate every 6 days (before 7-day server expiry), but retry
@@ -136,9 +131,7 @@ impl SessionManager {
             let mut next_delay = SESSION_ROTATION_INTERVAL;
             loop {
                 tokio::time::sleep(next_delay).await;
-                match Self::create_pool(&mut rotation_client, &rotation_db, rotation_pool_size)
-                    .await
-                {
+                match Self::create_pool(rotation_clients.as_ref(), &rotation_db).await {
                     Ok(new_pool) => {
                         let new_pool = Arc::new(new_pool);
                         let old_pool = {
@@ -154,8 +147,9 @@ impl SessionManager {
                         );
 
                         wait_for_pool_drain(&old_pool).await;
-                        for slot in &old_pool.slots {
-                            match Self::delete_session(&mut rotation_client, &slot.name).await {
+                        for (idx, slot) in old_pool.slots.iter().enumerate() {
+                            let mut delete_client = rotation_clients[idx].clone();
+                            match Self::delete_session(&mut delete_client, &slot.name).await {
                                 Ok(()) => {
                                     tracing::info!(session = %slot.name, "deleted drained multiplexed session");
                                 }
@@ -180,6 +174,7 @@ impl SessionManager {
 
         Ok(Self {
             current,
+            clients,
             rotation_handle: handle,
         })
     }
@@ -187,19 +182,22 @@ impl SessionManager {
     /// Acquire a lease for the current session.
     ///
     /// The lease keeps a randomly selected session alive for the duration of an in-flight query.
-    pub(crate) async fn lease(&self) -> SessionLease {
+    pub(crate) async fn lease(&self) -> (SessionLease, GrpcClient) {
         let pool = self.current.read().await.clone();
-        pool.lease_random()
+        debug_assert_eq!(
+            pool.slots.len(),
+            self.clients.len(),
+            "session pool size must match transport pool size"
+        );
+        let (idx, lease) = pool.lease_random();
+        (lease, self.clients[idx].clone())
     }
 
-    async fn create_pool(
-        client: &mut GrpcClient,
-        database: &str,
-        pool_size: usize,
-    ) -> Result<SessionPool> {
-        let mut names = Vec::with_capacity(pool_size);
-        for _ in 0..pool_size {
-            names.push(Self::create_session(client, database).await?);
+    async fn create_pool(clients: &[GrpcClient], database: &str) -> Result<SessionPool> {
+        let mut names = Vec::with_capacity(clients.len());
+        for client in clients {
+            let mut client = client.clone();
+            names.push(Self::create_session(&mut client, database).await?);
         }
         Ok(SessionPool::from_names(names))
     }
@@ -297,14 +295,10 @@ mod tests {
             "sessions/b".to_string(),
             "sessions/c".to_string(),
         ]));
-        let manager = SessionManager {
-            current: Arc::new(RwLock::new(pool)),
-            rotation_handle: tokio::spawn(async { std::future::pending::<()>().await }),
-        };
         let allowed = HashSet::from(["sessions/a", "sessions/b", "sessions/c"]);
 
         for _ in 0..64 {
-            let lease = manager.lease().await;
+            let (_, lease) = pool.lease_random();
             assert!(
                 allowed.contains(lease.name()),
                 "unexpected lease {}",
