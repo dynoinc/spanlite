@@ -17,4 +17,5 @@ pub use params::ToSpanner;
 
 pub mod types {
     pub use crate::proto::google::spanner::v1::{KeyRange, KeySet, Type, TypeCode};
+    pub use prost_types::Timestamp;
 }

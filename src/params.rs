@@ -128,6 +128,22 @@ impl ToSpanner for String {
     }
 }
 
+impl ToSpanner for prost_types::Timestamp {
+    fn to_spanner(&self) -> (prost_types::Value, pb::Type) {
+        (
+            prost_types::Value {
+                // Spanner TIMESTAMP params are RFC3339 strings with trailing "Z".
+                kind: Some(prost_types::value::Kind::StringValue(self.to_string())),
+            },
+            Self::spanner_type(),
+        )
+    }
+
+    fn spanner_type() -> pb::Type {
+        scalar_type(pb::TypeCode::Timestamp)
+    }
+}
+
 impl ToSpanner for &[u8] {
     fn to_spanner(&self) -> (prost_types::Value, pb::Type) {
         (
@@ -267,6 +283,34 @@ mod tests {
         let (val, ty) = String::from("world").to_spanner();
         assert_eq!(ty.code, pb::TypeCode::String as i32);
         assert!(matches!(val.kind, Some(Kind::StringValue(s)) if s == "world"));
+    }
+
+    #[test]
+    fn timestamp_encoded_as_rfc3339_string() {
+        let ts = prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 123_000_000,
+        };
+        let (val, ty) = ts.to_spanner();
+        assert_eq!(ty.code, pb::TypeCode::Timestamp as i32);
+        assert!(matches!(
+            val.kind,
+            Some(Kind::StringValue(s)) if s == "2023-11-14T22:13:20.123Z"
+        ));
+    }
+
+    #[test]
+    fn timestamp_normalizes_before_encoding() {
+        let ts = prost_types::Timestamp {
+            seconds: 1,
+            nanos: -1,
+        };
+        let (val, ty) = ts.to_spanner();
+        assert_eq!(ty.code, pb::TypeCode::Timestamp as i32);
+        assert!(matches!(
+            val.kind,
+            Some(Kind::StringValue(s)) if s == "1970-01-01T00:00:00.999999999Z"
+        ));
     }
 
     #[test]
