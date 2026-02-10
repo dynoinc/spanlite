@@ -3,15 +3,15 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 
-use crate::de::RowDeserializer;
+use crate::de::IntoRowDeserializer;
 use crate::error::Error;
 use crate::proto::google::spanner::v1 as pb;
 
 /// Column metadata shared across all rows in a result set.
 #[derive(Debug, Clone)]
-pub(crate) struct ColumnMeta {
-    pub(crate) name: String,
-    pub(crate) spanner_type: pb::Type,
+pub struct ColumnMeta {
+    pub name: String,
+    pub spanner_type: pb::Type,
 }
 
 /// A single row of Spanner data.
@@ -19,15 +19,18 @@ pub(crate) struct ColumnMeta {
 /// Columns are shared via Arc (allocated once per result set).
 /// Values are owned per row.
 #[derive(Debug, Clone)]
-pub(crate) struct Row {
-    pub(crate) columns: Arc<Vec<ColumnMeta>>,
-    pub(crate) values: Vec<prost_types::Value>,
+pub struct Row {
+    pub columns: Arc<Vec<ColumnMeta>>,
+    pub values: Vec<prost_types::Value>,
 }
 
 impl Row {
-    /// Deserialize this row into a user-defined struct.
-    pub(crate) fn deserialize<T: DeserializeOwned>(&self) -> Result<T, Error> {
-        let de = RowDeserializer::new(&self.columns, &self.values);
+    /// Deserialize this row into a user-defined struct by consuming it.
+    ///
+    /// Moves owned strings instead of cloning, avoiding allocations on the
+    /// deserialization path.
+    pub fn deserialize<T: DeserializeOwned>(self) -> Result<T, Error> {
+        let de = IntoRowDeserializer::new(self.columns, self.values);
         T::deserialize(de)
     }
 }
@@ -38,18 +41,24 @@ impl Row {
 /// - `chunked_value` merging (strings concatenate, lists merge last/first recursively)
 /// - Row boundary detection (emit row every `num_columns` values)
 /// - `resume_token` tracking
-pub(crate) struct StreamingAssembler {
+pub struct StreamingAssembler {
     columns: Option<Arc<Vec<ColumnMeta>>>,
     num_columns: usize,
     pending_values: VecDeque<prost_types::Value>,
     /// When the previous PartialResultSet had chunked_value=true, this holds
     /// the incomplete trailing value to merge with the next message's first value.
     chunked_tail: Option<prost_types::Value>,
-    pub(crate) resume_token: Vec<u8>,
+    pub resume_token: Vec<u8>,
+}
+
+impl Default for StreamingAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StreamingAssembler {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             columns: None,
             num_columns: 0,
@@ -60,10 +69,18 @@ impl StreamingAssembler {
     }
 
     /// Process one PartialResultSet and return any complete rows.
-    pub(crate) fn push(&mut self, partial: pb::PartialResultSet) -> Result<Vec<Row>, Error> {
+    pub fn push(&mut self, partial: pb::PartialResultSet) -> Result<Vec<Row>, Error> {
+        let pb::PartialResultSet {
+            metadata,
+            mut values,
+            chunked_value,
+            resume_token,
+            ..
+        } = partial;
+
         // Extract metadata from the first message
         if self.columns.is_none()
-            && let Some(metadata) = &partial.metadata
+            && let Some(metadata) = &metadata
             && let Some(row_type) = &metadata.row_type
         {
             let cols: Vec<ColumnMeta> = row_type
@@ -78,33 +95,26 @@ impl StreamingAssembler {
             self.columns = Some(Arc::new(cols));
         }
 
-        // Track resume_token
-        if !partial.resume_token.is_empty() {
-            self.resume_token = partial.resume_token.clone();
+        // Track resume_token (move, not clone)
+        if !resume_token.is_empty() {
+            self.resume_token = resume_token;
         }
-
-        let mut values = partial.values;
 
         // Merge chunked_tail with first value if present
         if let Some(tail) = self.chunked_tail.take() {
             if let Some(first) = values.first_mut() {
                 *first = merge_values(tail, std::mem::take(first));
             } else {
-                // No new values — put tail back
                 self.chunked_tail = Some(tail);
             }
         }
 
         // If this message is chunked, pop the last value as the new tail
-        if partial.chunked_value
-            && !values.is_empty()
-            && let Some(last) = values.pop()
-        {
+        if chunked_value && let Some(last) = values.pop() {
             self.chunked_tail = Some(last);
         }
 
-        // Accumulate values and emit complete rows
-        self.pending_values.extend(values);
+        // Emit complete rows
         let mut rows = Vec::new();
 
         if self.num_columns > 0 {
@@ -113,17 +123,33 @@ impl StreamingAssembler {
                     "row metadata missing columns while values are present".to_string(),
                 ));
             };
-            while self.pending_values.len() >= self.num_columns {
-                let mut row_values = Vec::with_capacity(self.num_columns);
-                for _ in 0..self.num_columns {
-                    if let Some(value) = self.pending_values.pop_front() {
-                        row_values.push(value);
-                    }
+
+            if self.pending_values.is_empty() {
+                // Fast path: drain Vec directly, skip VecDeque
+                let mut iter = values.into_iter();
+                while iter.len() >= self.num_columns {
+                    rows.push(Row {
+                        columns: columns.clone(),
+                        values: iter.by_ref().take(self.num_columns).collect(),
+                    });
                 }
-                rows.push(Row {
-                    columns: columns.clone(),
-                    values: row_values,
-                });
+                // Only leftover values (< num_columns) go into VecDeque
+                self.pending_values.extend(iter);
+            } else {
+                // Slow path: merge with pending values from previous partials
+                self.pending_values.extend(values);
+                while self.pending_values.len() >= self.num_columns {
+                    let mut row_values = Vec::with_capacity(self.num_columns);
+                    for _ in 0..self.num_columns {
+                        if let Some(value) = self.pending_values.pop_front() {
+                            row_values.push(value);
+                        }
+                    }
+                    rows.push(Row {
+                        columns: columns.clone(),
+                        values: row_values,
+                    });
+                }
             }
         }
 
@@ -142,28 +168,21 @@ pub(crate) fn merge_values(
     use prost_types::value::Kind;
 
     match (left.kind, right.kind) {
-        (Some(Kind::StringValue(a)), Some(Kind::StringValue(b))) => prost_types::Value {
-            kind: Some(Kind::StringValue(format!("{a}{b}"))),
-        },
-        (Some(Kind::ListValue(mut a)), Some(Kind::ListValue(mut b))) => {
-            // Merge last element of a with first element of b
+        (Some(Kind::StringValue(mut a)), Some(Kind::StringValue(b))) => {
+            a.push_str(&b);
+            prost_types::Value {
+                kind: Some(Kind::StringValue(a)),
+            }
+        }
+        (Some(Kind::ListValue(mut a)), Some(Kind::ListValue(b))) => {
+            // Merge last element of a with first element of b, then concat rest
             if !a.values.is_empty() && !b.values.is_empty() {
-                let Some(a_last) = a.values.pop() else {
-                    a.values.extend(b.values);
-                    return prost_types::Value {
-                        kind: Some(Kind::ListValue(a)),
-                    };
-                };
-                let mut b_drain = b.values.drain(..);
-                let Some(b_first) = b_drain.next() else {
-                    a.values.push(a_last);
-                    return prost_types::Value {
-                        kind: Some(Kind::ListValue(a)),
-                    };
-                };
-                let merged = merge_values(a_last, b_first);
-                a.values.push(merged);
-                a.values.extend(b_drain);
+                let a_last = a.values.pop().unwrap();
+                let mut b_iter = b.values.into_iter();
+                let b_first = b_iter.next().unwrap();
+                a.values.reserve(1 + b_iter.len());
+                a.values.push(merge_values(a_last, b_first));
+                a.values.extend(b_iter);
             } else {
                 a.values.extend(b.values);
             }
@@ -264,7 +283,12 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(asm.resume_token, vec![1, 2, 3]);
 
-        let r0: R = rows[0].deserialize().expect("first row should deserialize");
+        let mut rows = rows.into_iter();
+        let r0: R = rows
+            .next()
+            .unwrap()
+            .deserialize()
+            .expect("first row should deserialize");
         assert_eq!(
             r0,
             R {
@@ -273,7 +297,9 @@ mod tests {
             }
         );
 
-        let r1: R = rows[1]
+        let r1: R = rows
+            .next()
+            .unwrap()
             .deserialize()
             .expect("second row should deserialize");
         assert_eq!(
@@ -321,7 +347,7 @@ mod tests {
             ..Default::default()
         };
 
-        let rows = asm.push(p2).expect("second partial should parse");
+        let mut rows = asm.push(p2).expect("second partial should parse");
         assert_eq!(rows.len(), 1);
 
         #[derive(Deserialize, Debug)]
@@ -329,7 +355,8 @@ mod tests {
             x: String,
             y: String,
         }
-        let r: R = rows[0]
+        let r: R = rows
+            .remove(0)
             .deserialize()
             .expect("assembled row should deserialize");
         assert_eq!(r.x, "a");
@@ -364,14 +391,15 @@ mod tests {
             ..Default::default()
         };
 
-        let rows = asm.push(p2).expect("chunked second partial should parse");
+        let mut rows = asm.push(p2).expect("chunked second partial should parse");
         assert_eq!(rows.len(), 1);
 
         #[derive(Deserialize, Debug)]
         struct R {
             msg: String,
         }
-        let r: R = rows[0]
+        let r: R = rows
+            .remove(0)
             .deserialize()
             .expect("chunked row should deserialize");
         assert_eq!(r.msg, "hello");

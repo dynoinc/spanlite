@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor};
 use serde::forward_to_deserialize_any;
 
@@ -5,26 +7,23 @@ use crate::error::Error;
 use crate::proto::google::spanner::v1 as pb;
 use crate::result::ColumnMeta;
 
-/// Deserializes a Row into a user-defined `T: DeserializeOwned`.
-///
-/// Presents the row as a map of column_name → typed value, using Spanner
-/// type metadata to correctly decode values (e.g. INT64 string → i64).
-pub(crate) struct RowDeserializer<'a> {
-    columns: &'a [ColumnMeta],
-    values: &'a [prost_types::Value],
+/// Deserializes a Row by consuming it — moves owned strings instead of cloning.
+pub(crate) struct IntoRowDeserializer {
+    columns: Arc<Vec<ColumnMeta>>,
+    values: Vec<prost_types::Value>,
 }
 
-impl<'a> RowDeserializer<'a> {
-    pub(crate) fn new(columns: &'a [ColumnMeta], values: &'a [prost_types::Value]) -> Self {
+impl IntoRowDeserializer {
+    pub(crate) fn new(columns: Arc<Vec<ColumnMeta>>, values: Vec<prost_types::Value>) -> Self {
         Self { columns, values }
     }
 }
 
-impl<'de, 'a> de::Deserializer<'de> for RowDeserializer<'a> {
+impl<'de> de::Deserializer<'de> for IntoRowDeserializer {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        visitor.visit_map(RowMapAccess {
+        visitor.visit_map(IntoRowMapAccess {
             columns: self.columns,
             values: self.values,
             index: 0,
@@ -38,13 +37,13 @@ impl<'de, 'a> de::Deserializer<'de> for RowDeserializer<'a> {
     }
 }
 
-struct RowMapAccess<'a> {
-    columns: &'a [ColumnMeta],
-    values: &'a [prost_types::Value],
+struct IntoRowMapAccess {
+    columns: Arc<Vec<ColumnMeta>>,
+    values: Vec<prost_types::Value>,
     index: usize,
 }
 
-impl<'de, 'a> MapAccess<'de> for RowMapAccess<'a> {
+impl<'de> MapAccess<'de> for IntoRowMapAccess {
     type Error = Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
@@ -66,91 +65,79 @@ impl<'de, 'a> MapAccess<'de> for RowMapAccess<'a> {
         let col = self.columns.get(idx).ok_or_else(|| {
             Error::Deserialize("row metadata/value cursor out of sync".to_string())
         })?;
-        let val = self.values.get(idx).ok_or_else(|| {
-            Error::Deserialize(format!("row missing value for column '{}'", col.name))
-        })?;
+        if idx >= self.values.len() {
+            return Err(Error::Deserialize(format!(
+                "row missing value for column '{}'",
+                col.name
+            )));
+        }
+        let val = std::mem::take(&mut self.values[idx]);
         self.index += 1;
-        seed.deserialize(ValueDeserializer {
+        seed.deserialize(IntoValueDeserializer {
             value: val,
             spanner_type: &col.spanner_type,
         })
     }
 }
 
-/// Deserializes a single protobuf Value using Spanner type metadata.
-struct ValueDeserializer<'a> {
-    value: &'a prost_types::Value,
+/// Deserializes a single owned protobuf Value — moves strings instead of cloning.
+struct IntoValueDeserializer<'a> {
+    value: prost_types::Value,
     spanner_type: &'a pb::Type,
 }
 
-impl<'a> ValueDeserializer<'a> {
-    fn kind(&self) -> Option<&'a prost_types::value::Kind> {
-        self.value.kind.as_ref()
-    }
-
-    fn is_null(&self) -> bool {
-        matches!(
-            self.kind(),
-            Some(prost_types::value::Kind::NullValue(_)) | None
-        )
-    }
-}
-
-impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
+impl<'de, 'a> de::Deserializer<'de> for IntoValueDeserializer<'a> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        if self.is_null() {
-            return visitor.visit_none();
-        }
+        use prost_types::value::Kind;
+
+        let kind = match self.value.kind {
+            None | Some(Kind::NullValue(_)) => return visitor.visit_none(),
+            Some(k) => k,
+        };
 
         let code =
             pb::TypeCode::try_from(self.spanner_type.code).unwrap_or(pb::TypeCode::Unspecified);
 
         match code {
-            pb::TypeCode::Bool => match self.kind() {
-                Some(prost_types::value::Kind::BoolValue(b)) => visitor.visit_bool(*b),
+            pb::TypeCode::Bool => match kind {
+                Kind::BoolValue(b) => visitor.visit_bool(b),
                 _ => Err(Error::Deserialize(
                     "expected bool value for BOOL column".to_string(),
                 )),
             },
-            pb::TypeCode::Int64 => {
-                // Spanner sends INT64 as string
-                match self.kind() {
-                    Some(prost_types::value::Kind::StringValue(s)) => {
-                        let n: i64 = s.parse().map_err(|e| {
-                            Error::Deserialize(format!("invalid INT64 value '{s}': {e}"))
-                        })?;
-                        visitor.visit_i64(n)
-                    }
-                    _ => Err(Error::Deserialize(
-                        "expected string value for INT64 column".into(),
-                    )),
+            pb::TypeCode::Int64 => match kind {
+                Kind::StringValue(s) => {
+                    let n: i64 = s.parse().map_err(|e| {
+                        Error::Deserialize(format!("invalid INT64 value '{s}': {e}"))
+                    })?;
+                    visitor.visit_i64(n)
                 }
-            }
-            pb::TypeCode::Float64 => {
-                match self.kind() {
-                    Some(prost_types::value::Kind::NumberValue(n)) => visitor.visit_f64(*n),
-                    Some(prost_types::value::Kind::StringValue(s)) => {
-                        // Handle "NaN", "Infinity", "-Infinity"
-                        let n: f64 = match s.as_str() {
-                            "NaN" => f64::NAN,
-                            "Infinity" => f64::INFINITY,
-                            "-Infinity" => f64::NEG_INFINITY,
-                            _ => s.parse().map_err(|e| {
-                                Error::Deserialize(format!("invalid FLOAT64 value '{s}': {e}"))
-                            })?,
-                        };
-                        visitor.visit_f64(n)
-                    }
-                    _ => Err(Error::Deserialize(
-                        "expected number value for FLOAT64 column".into(),
-                    )),
+                _ => Err(Error::Deserialize(
+                    "expected string value for INT64 column".into(),
+                )),
+            },
+            pb::TypeCode::Float64 => match kind {
+                Kind::NumberValue(n) => visitor.visit_f64(n),
+                Kind::StringValue(s) => {
+                    let n: f64 = match s.as_str() {
+                        "NaN" => f64::NAN,
+                        "Infinity" => f64::INFINITY,
+                        "-Infinity" => f64::NEG_INFINITY,
+                        _ => s.parse().map_err(|e| {
+                            Error::Deserialize(format!("invalid FLOAT64 value '{s}': {e}"))
+                        })?,
+                    };
+                    visitor.visit_f64(n)
                 }
-            }
-            pb::TypeCode::Float32 => match self.kind() {
-                Some(prost_types::value::Kind::NumberValue(n)) => visitor.visit_f32(*n as f32),
-                Some(prost_types::value::Kind::StringValue(s)) => {
+                _ => Err(Error::Deserialize(
+                    "expected number value for FLOAT64 column".into(),
+                )),
+            },
+            pb::TypeCode::Float32 => match kind {
+                Kind::NumberValue(n) => visitor.visit_f32(n as f32),
+                Kind::StringValue(s) => {
                     let n: f32 = match s.as_str() {
                         "NaN" => f32::NAN,
                         "Infinity" => f32::INFINITY,
@@ -169,17 +156,17 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
             | pb::TypeCode::Timestamp
             | pb::TypeCode::Date
             | pb::TypeCode::Numeric
-            | pb::TypeCode::Json => match self.kind() {
-                Some(prost_types::value::Kind::StringValue(s)) => visitor.visit_string(s.clone()),
+            | pb::TypeCode::Json => match kind {
+                Kind::StringValue(s) => visitor.visit_string(s),
                 _ => Err(Error::Deserialize(format!(
                     "expected string value for {code:?} column"
                 ))),
             },
-            pb::TypeCode::Bytes => match self.kind() {
-                Some(prost_types::value::Kind::StringValue(s)) => {
+            pb::TypeCode::Bytes => match kind {
+                Kind::StringValue(s) => {
                     use base64::Engine;
                     let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(s)
+                        .decode(&s)
                         .map_err(|e| {
                             Error::Deserialize(format!("invalid base64 BYTES value: {e}"))
                         })?;
@@ -189,8 +176,8 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
                     "expected string value for BYTES column".into(),
                 )),
             },
-            pb::TypeCode::Array => match self.kind() {
-                Some(prost_types::value::Kind::ListValue(list)) => {
+            pb::TypeCode::Array => match kind {
+                Kind::ListValue(list) => {
                     let elem_type =
                         self.spanner_type
                             .array_element_type
@@ -198,24 +185,23 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
                             .ok_or_else(|| {
                                 Error::Deserialize("ARRAY type missing element type".into())
                             })?;
-                    visitor.visit_seq(ArraySeqAccess {
-                        values: &list.values,
+                    visitor.visit_seq(IntoArraySeqAccess {
+                        values: list.values.into_iter(),
                         elem_type,
-                        index: 0,
                     })
                 }
                 _ => Err(Error::Deserialize(
                     "expected list value for ARRAY column".into(),
                 )),
             },
-            pb::TypeCode::Struct => match self.kind() {
-                Some(prost_types::value::Kind::ListValue(list)) => {
+            pb::TypeCode::Struct => match kind {
+                Kind::ListValue(list) => {
                     let struct_type = self.spanner_type.struct_type.as_ref().ok_or_else(|| {
                         Error::Deserialize("STRUCT type missing struct_type".into())
                     })?;
-                    visitor.visit_map(StructMapAccess {
+                    visitor.visit_map(IntoStructMapAccess {
                         fields: &struct_type.fields,
-                        values: &list.values,
+                        values: list.values.into_iter(),
                         index: 0,
                     })
                 }
@@ -230,10 +216,9 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
     }
 
     fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Self::Error> {
-        if self.is_null() {
-            visitor.visit_none()
-        } else {
-            visitor.visit_some(self)
+        match &self.value.kind {
+            None | Some(prost_types::value::Kind::NullValue(_)) => visitor.visit_none(),
+            Some(_) => visitor.visit_some(self),
         }
     }
 
@@ -252,43 +237,41 @@ impl<'de, 'a> de::Deserializer<'de> for ValueDeserializer<'a> {
     }
 }
 
-struct ArraySeqAccess<'a> {
-    values: &'a [prost_types::Value],
+struct IntoArraySeqAccess<'a> {
+    values: std::vec::IntoIter<prost_types::Value>,
     elem_type: &'a pb::Type,
-    index: usize,
 }
 
-impl<'de, 'a> SeqAccess<'de> for ArraySeqAccess<'a> {
+impl<'de, 'a> SeqAccess<'de> for IntoArraySeqAccess<'a> {
     type Error = Error;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(
         &mut self,
         seed: T,
     ) -> Result<Option<T::Value>, Self::Error> {
-        if self.index >= self.values.len() {
-            return Ok(None);
+        match self.values.next() {
+            None => Ok(None),
+            Some(val) => seed
+                .deserialize(IntoValueDeserializer {
+                    value: val,
+                    spanner_type: self.elem_type,
+                })
+                .map(Some),
         }
-        let val = &self.values[self.index];
-        self.index += 1;
-        seed.deserialize(ValueDeserializer {
-            value: val,
-            spanner_type: self.elem_type,
-        })
-        .map(Some)
     }
 
     fn size_hint(&self) -> Option<usize> {
-        Some(self.values.len() - self.index)
+        Some(self.values.len())
     }
 }
 
-struct StructMapAccess<'a> {
+struct IntoStructMapAccess<'a> {
     fields: &'a [pb::struct_type::Field],
-    values: &'a [prost_types::Value],
+    values: std::vec::IntoIter<prost_types::Value>,
     index: usize,
 }
 
-impl<'de, 'a> MapAccess<'de> for StructMapAccess<'a> {
+impl<'de, 'a> MapAccess<'de> for IntoStructMapAccess<'a> {
     type Error = Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(
@@ -306,21 +289,18 @@ impl<'de, 'a> MapAccess<'de> for StructMapAccess<'a> {
         &mut self,
         seed: V,
     ) -> Result<V::Value, Self::Error> {
-        let idx = self.index;
-        let field = self.fields.get(idx).ok_or_else(|| {
-            Error::Deserialize("struct metadata/value cursor out of sync".to_string())
-        })?;
-        let val = self.values.get(idx).ok_or_else(|| {
+        let field = &self.fields[self.index];
+        let val = self.values.next().ok_or_else(|| {
             Error::Deserialize(format!(
-                "STRUCT field '{}' missing value at index {idx}",
-                field.name
+                "STRUCT field '{}' missing value at index {}",
+                field.name, self.index
             ))
         })?;
         self.index += 1;
         let field_type = field.r#type.as_ref().ok_or_else(|| {
             Error::Deserialize(format!("STRUCT field '{}' missing type", field.name))
         })?;
-        seed.deserialize(ValueDeserializer {
+        seed.deserialize(IntoValueDeserializer {
             value: val,
             spanner_type: field_type,
         })

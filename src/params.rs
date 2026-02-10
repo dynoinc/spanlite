@@ -206,7 +206,7 @@ impl<T: ToSpanner> ToSpanner for Option<T> {
 }
 
 /// Convert a slice of `(&str, &dyn ToSpanner)` pairs into protobuf param structs.
-pub(crate) fn params_to_proto(
+pub fn params_to_proto(
     params: &[(&str, &dyn ToSpanner)],
 ) -> (prost_types::Struct, HashMap<String, pb::Type>) {
     let mut fields = BTreeMap::new();
@@ -214,8 +214,9 @@ pub(crate) fn params_to_proto(
 
     for (name, value) in params {
         let (val, ty) = value.to_spanner();
-        fields.insert(name.to_string(), val);
-        param_types.insert(name.to_string(), ty);
+        let key = name.to_string();
+        param_types.insert(key.clone(), ty);
+        fields.insert(key, val);
     }
 
     (prost_types::Struct { fields }, param_types)
