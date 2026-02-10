@@ -2,7 +2,7 @@
 name = "spanlite"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.93"
+rust-version = "1.88"
 
 [dependencies]
 tonic = { version = "0.14", features = ["tls-webpki-roots", "tls-ring", "channel"] }

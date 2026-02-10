@@ -12,7 +12,7 @@ Minimal async Rust client for Google Cloud Spanner, optimized for high-throughpu
 
 ## Requirements
 
-- Rust toolchain `1.85+` (see `rust-toolchain.toml`)
+- Rust toolchain `1.88+`
 - `protoc` for build-time protobuf generation
 - Docker only for emulator integration tests
 
